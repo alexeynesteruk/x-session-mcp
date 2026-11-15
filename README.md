@@ -1,6 +1,6 @@
-## twitter-mcp-server
+## x-session-mcp
 
-Twitter/X client MCP server that works off your logged-in session cookies
+MCP server for X that uses your logged-in session cookies
 (`auth_token` + `ct0`), no paid API key. Built on
 [twikit](https://github.com/d60/twikit), pinned to a community patch because
 upstream twikit has been broken against X since March 2026.
@@ -25,14 +25,14 @@ with stdio support, mcp SDK 2.x, and the fixes listed in the git log.
 - `like_tweet` - Like or unlike a tweet
 - `retweet` - Retweet or undo a retweet
 - `post_tweet` - Post a tweet or a reply; returns the new tweet's id
-- `follow_user` - Follow or unfollow a user
+- `follow_user` - Follow or unfollow a user; a pending private-account follow request returns `"status": "requested"`
 
 Arguments: usernames work with or without `@` (a profile URL also works), tweet
 IDs can be tweet URLs, and `count` (1-50) is filled across X's pages (X serves
 about 10-20 items a page; at most 5 pages per call). Tools carry MCP
 `readOnlyHint` / `destructiveHint` annotations, so clients can auto-approve
 reads and prompt on writes. Liking or retweeting something already
-liked/retweeted succeeds with `"already_done": true`.
+liked/retweeted succeeds with `"already_done": true`. Write responses are checked for all reported errors. An unconfirmed write returns an error telling you to check the account before retrying, because the action may already have taken effect.
 
 ### Tweet fields
 
@@ -55,23 +55,24 @@ Every tool that returns tweets returns a JSON list of:
 ```bash
 uv venv --python 3.14 .venv
 uv pip install --python .venv/bin/python -r requirements.lock
-cp .env.example .env   # fill in TWITTER_AUTH_TOKEN and TWITTER_CT0
+cp .env.example .env   # fill in X_AUTH_TOKEN and X_CT0
 chmod 600 .env
 ```
 
 ```json
 {
   "mcpServers": {
-    "twitter": {
-      "command": "/path/to/twitter-mcp-server/.venv/bin/python",
-      "args": ["/path/to/twitter-mcp-server/main.py"]
+    "x-session": {
+      "command": "/path/to/x-session-mcp/.venv/bin/python",
+      "args": ["/path/to/x-session-mcp/main.py"]
     }
   }
 }
 ```
 
 `.env` is read from the script's directory, so the client's working directory
-does not matter. `TWITTER_AUTH_TOKEN`/`TWITTER_CT0` can also be passed as env vars.
+does not matter. `X_AUTH_TOKEN`/`X_CT0` can also be passed as env vars
+(`TWITTER_AUTH_TOKEN`/`TWITTER_CT0` still work as aliases).
 
 `requirements.txt` lists the direct dependencies; `requirements.lock` is the
 full tested set (`uv pip compile requirements.txt --python-version 3.14 -o
@@ -103,8 +104,8 @@ Host/Origin checks off.
 ### Docker
 
 ```bash
-docker build -t twitter-mcp-server .
-docker run --rm -e APP_PORT=3000 -e APP_HOST=0.0.0.0 -p 127.0.0.1:3000:3000 twitter-mcp-server
+docker build -t x-session-mcp .
+docker run --rm -e APP_PORT=3000 -e APP_HOST=0.0.0.0 -p 127.0.0.1:3000:3000 x-session-mcp
 ```
 
 The image installs from `requirements.lock`, contains only `main.py` and

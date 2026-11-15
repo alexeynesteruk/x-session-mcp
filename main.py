@@ -36,7 +36,7 @@ from config import HOST, PORT
 
 logger = logging.getLogger(__name__)
 
-mcp = MCPServer(name="twitter-mcp-server")
+mcp = MCPServer(name="x-session-mcp")
 # httpx logs every X request URL at INFO; keep the MCP client's stderr readable.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -119,7 +119,7 @@ def get_auth_context(
     cookies, so anything that can reach the port cannot act as the server
     owner. The mode is decided by config, not by whether the transport
     happened to expose headers. Over stdio the cookies come from
-    TWITTER_AUTH_TOKEN/TWITTER_CT0.
+    X_AUTH_TOKEN/X_CT0 (TWITTER_* aliases still accepted).
     """
     if http_mode is None:
         http_mode = HTTP_MODE
@@ -128,10 +128,10 @@ def get_auth_context(
         if not header:
             raise ToolError(AUTH_REQUIRED)
         return parse_bearer(header)
-    auth_token = os.getenv("TWITTER_AUTH_TOKEN")
-    ct0 = os.getenv("TWITTER_CT0")
+    auth_token = os.getenv("X_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN")
+    ct0 = os.getenv("X_CT0") or os.getenv("TWITTER_CT0")
     if not auth_token or not ct0:
-        raise ToolError(f"{AUTH_REQUIRED} (set TWITTER_AUTH_TOKEN and TWITTER_CT0)")
+        raise ToolError(f"{AUTH_REQUIRED} (set X_AUTH_TOKEN and X_CT0)")
     return checked_cookies(auth_token, ct0)
 
 
@@ -185,7 +185,7 @@ def tweet_id_arg(value: str) -> str:
     value = value.strip()
     if re.fullmatch(r"[0-9]{1,25}", value):
         return value
-    match = re.search(r"/status(?:es)?/([0-9]{1,25})", value)
+    match = re.search(r"/status(?:es)?/([0-9]{1,25})(?=$|[/?#])", value)
     if not match:
         raise ToolError(f"Invalid argument (tweet_id): {value[:60]!r}")
     return match.group(1)
@@ -463,32 +463,39 @@ async def _create_client(auth: AuthContext) -> XClient:
 
 async def get_client(ctx: Context | None) -> XClient:
     auth = get_auth_context(ctx.headers if ctx is not None else None)
-    client = _clients.pop(auth, None)
-    if client is not None:
-        _clients[auth] = client  # now the most recently used
-        return client
-    # A per-pair handshake, so one caller's slow handshake (HTTP mode) never
-    # holds up another caller's.
-    task = _pending.get(auth)
-    if task is None or (task.done() and (task.cancelled() or task.exception())):
-        task = asyncio.ensure_future(_create_client(auth))
-        _pending[auth] = task
+    while True:
+        client = _clients.pop(auth, None)
+        if client is not None:
+            _clients[auth] = client  # now the most recently used
+            return client
+        # A per-pair handshake, so one caller's slow handshake (HTTP mode) never
+        # holds up another caller's.
+        task = _pending.get(auth)
+        if task is None or (task.done() and (task.cancelled() or task.exception())):
+            task = asyncio.ensure_future(_create_client(auth))
+            _pending[auth] = task
 
-        def done(finished: asyncio.Future) -> None:
-            if _pending.get(auth) is finished:
-                del _pending[auth]
-            if not finished.cancelled():
-                finished.exception()  # retrieved, even if every caller left
+            def done(finished: asyncio.Future) -> None:
+                if _pending.get(auth) is finished:
+                    del _pending[auth]
+                if not finished.cancelled():
+                    finished.exception()  # retrieved, even if every caller left
 
-        task.add_done_callback(done)
-    # wait() leaves the shared task running if this caller is cancelled
-    # (unlike awaiting it), without shield()'s orphaned-error logging.
-    await asyncio.wait({task})
-    return task.result()
+            task.add_done_callback(done)
+        # wait() leaves the shared task running if this caller is cancelled
+        # (unlike awaiting it), without shield()'s orphaned-error logging.
+        await asyncio.wait({task})
+        client = task.result()
+        if not client.evicted:
+            return client
+        # Other cold handshakes can fill the LRU before this waiter resumes.
+        # Reacquire instead of handing a closed client to the tool.
+        if _pending.get(auth) is task:
+            del _pending[auth]
 
 
 @contextmanager
-def twitter_errors() -> Iterator[None]:
+def x_errors() -> Iterator[None]:
     """Turn twikit exceptions into short, actionable tool errors."""
     try:
         yield
@@ -558,7 +565,7 @@ def twitter_errors() -> Iterator[None]:
 async def x_client(ctx: Context | None) -> AsyncIterator[XClient]:
     """Yield the caller's twikit Client; any failure in the block, including
     parsing twikit's lazily-read Tweet fields, becomes a ToolError."""
-    with twitter_errors():
+    with x_errors():
         client = await get_client(ctx)
         client.inflight += 1
         try:
@@ -575,17 +582,30 @@ def check_write(
     """twikit only raises for a few GraphQL error codes; X answers most
     rejected likes/retweets with 200 and an errors array. Returns True when
     X said the action was already in place (e.g. 139 already liked)."""
+    unconfirmed = "X did not confirm the action. Check the account before retrying."
+    if not 200 <= response.status_code < 300:
+        raise ToolError(f"{unconfirmed} (HTTP {response.status_code})")
     try:
         data = response.json()
     except ValueError:
-        return False
-    if isinstance(data, dict) and data.get("errors"):
-        first = data["errors"][0]
-        if isinstance(first, dict) and first.get("code") in already_done:
-            return True
-        message = first.get("message") if isinstance(first, dict) else first
+        raise ToolError(f"{unconfirmed} (invalid JSON response)") from None
+    if not isinstance(data, dict) or not data:
+        raise ToolError(f"{unconfirmed} (unexpected response shape)")
+    failures = data.get("errors") or []
+    if not isinstance(failures, list):
+        raise ToolError(f"{unconfirmed} (invalid errors field)")
+    for failure in failures:
+        if isinstance(failure, dict) and failure.get("code") in already_done:
+            continue
+        message = failure.get("message") if isinstance(failure, dict) else failure
         raise ToolError(f"X rejected the action: {brief(Exception(message))}")
-    return False
+    if (
+        not failures
+        and not data.get("data")
+        and not any(data.get(key) for key in ("id", "id_str", "rest_id"))
+    ):
+        raise ToolError(f"{unconfirmed} (missing result)")
+    return bool(failures)
 
 
 def parse_count(count: int | str) -> int:
@@ -678,13 +698,19 @@ def tweets_json(tweets, count: int) -> str:
     return json.dumps([tweet_to_dict(t) for t in list(tweets)[:count]])
 
 
+def unique_items(items: Iterable, seen: set) -> Iterator:
+    """Update membership as each item arrives, including duplicates in a page."""
+    for item in items:
+        item_id = getattr(item, "id", None)
+        if item_id not in seen:
+            seen.add(item_id)
+            yield item
+
+
 async def collect(result: Result | list, count: int) -> list:
     """Follow X's page cursors until `count` items (X serves ~10-20 a page)."""
-    items, seen = [], set()
-    for item in result:
-        if getattr(item, "id", None) not in seen:
-            seen.add(getattr(item, "id", None))
-            items.append(item)
+    seen = set()
+    items = list(unique_items(result, seen))
     for _ in range(MAX_PAGES - 1):
         if len(items) >= count or not getattr(result, "next_cursor", None):
             break
@@ -698,10 +724,9 @@ async def collect(result: Result | list, count: int) -> list:
             # A later page failed (often a 429): keep what we have.
             logger.warning("Stopped paging after %d items: %s", len(items), brief(e))
             break
-        new = [item for item in result if getattr(item, "id", None) not in seen]
+        new = list(unique_items(result, seen))
         if not new:
             break
-        seen.update(item.id for item in new)
         items.extend(new)
     return items[:count]
 
@@ -885,7 +910,13 @@ async def post_tweet(
     reply_to = tweet_id_arg(reply_to_tweet_id) if reply_to_tweet_id.strip() else None
     async with x_client(ctx) as client:
         tweet = await client.create_tweet(text=text, reply_to=reply_to)
-        return json.dumps({"status": "success", "id": getattr(tweet, "id", None)})
+        tweet_id = getattr(tweet, "id", None)
+        if not isinstance(tweet_id, str) or not re.fullmatch(r"[0-9]{1,25}", tweet_id):
+            raise ToolError(
+                "X did not confirm the posted tweet's id. "
+                "Check the account before retrying."
+            )
+        return json.dumps({"status": "success", "id": tweet_id})
 
 
 @mcp.tool(
@@ -953,10 +984,31 @@ async def follow_user(
     username = username_arg(username)
     async with x_client(ctx) as client:
         user = await client.get_user_by_screen_name(username)
+        # twikit turns these REST responses into a User and discards errors
+        # that arrived with HTTP 200. Check the raw envelope before confirming.
         if action == "follow":
-            await client.follow_user(user.id)
+            result, raw = await client.v11.create_friendships(user.id)
         else:
-            await client.unfollow_user(user.id)
+            result, raw = await client.v11.destroy_friendships(user.id)
+        check_write(raw)
+        result_id = (
+            result.get("id_str") or result.get("rest_id") or result.get("id")
+            if isinstance(result, dict)
+            else None
+        )
+        if str(result_id) != str(user.id):
+            raise ToolError(
+                "X did not confirm the requested relationship. "
+                "Check the account before retrying."
+            )
+        if action == "follow" and result.get("follow_request_sent") is True:
+            return json.dumps({"status": "requested"})
+        following = result.get("following")
+        if following is not (action == "follow"):
+            raise ToolError(
+                "X did not confirm the requested relationship. "
+                "Check the account before retrying."
+            )
         return json.dumps({"status": "success"})
 
 
@@ -1033,8 +1085,10 @@ async def get_replies(
     tweet_id = tweet_id_arg(tweet_id)
     async with x_client(ctx) as client:
         response, _ = await client.gql.tweet_detail(tweet_id, None)
-        replies = replies_from_tweet_detail(client, tweet_id, response)
-        seen = {reply.id for reply in replies}
+        seen = set()
+        replies = list(
+            unique_items(replies_from_tweet_detail(client, tweet_id, response), seen)
+        )
         cursor = bottom_cursor(response)
         for _ in range(MAX_PAGES - 1):
             if len(replies) >= count_int or not cursor:
@@ -1048,10 +1102,9 @@ async def get_replies(
                 # A later page failed (often a 429): keep what we have.
                 logger.warning("Stopped paging replies: %s", brief(e))
                 break
-            new = [reply for reply in page if reply.id not in seen]
+            new = list(unique_items(page, seen))
             if not new:
                 break
-            seen.update(reply.id for reply in new)
             replies.extend(new)
             cursor = bottom_cursor(response)
         return tweets_json(replies, count_int)

@@ -1,4 +1,4 @@
-"""Unit tests for Twitter MCP server."""
+"""Unit tests for x-session-mcp."""
 
 import asyncio
 import json
@@ -30,7 +30,7 @@ from main import (
     post_tweet,
     replies_from_tweet_detail,
     search_tweets,
-    twitter_errors,
+    x_errors,
 )
 from main import XTransaction as RealXTransaction
 
@@ -62,8 +62,8 @@ def no_network(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stdio_cookies(monkeypatch):
-    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "env_token")
-    monkeypatch.setenv("TWITTER_CT0", "env_ct0")
+    monkeypatch.setenv("X_AUTH_TOKEN", "env_token")
+    monkeypatch.setenv("X_CT0", "env_ct0")
     monkeypatch.setattr(main, "HTTP_MODE", False)
     main._clients.clear()
     main._pending.clear()
@@ -163,9 +163,20 @@ def test_stdio_uses_env_cookies():
 
 
 def test_stdio_without_env_cookies(monkeypatch):
-    monkeypatch.delenv("TWITTER_AUTH_TOKEN")
+    for name in ("X_AUTH_TOKEN", "X_CT0", "TWITTER_AUTH_TOKEN", "TWITTER_CT0"):
+        monkeypatch.delenv(name, raising=False)
     with pytest.raises(ToolError, match="AUTH_REQUIRED"):
         get_auth_context(None, http_mode=False)
+
+
+def test_stdio_accepts_twitter_env_aliases(monkeypatch):
+    monkeypatch.delenv("X_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("X_CT0", raising=False)
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "legacy_token")
+    monkeypatch.setenv("TWITTER_CT0", "legacy_ct0")
+    assert get_auth_context(None, http_mode=False) == AuthContext(
+        "legacy_token", "legacy_ct0"
+    )
 
 
 @pytest.mark.parametrize("headers", [{}, None])
@@ -354,7 +365,7 @@ async def test_cache_evicts_oldest_and_closes_it(monkeypatch):
 
     with patch("main.XClient", side_effect=make):
         for i in range(3):
-            monkeypatch.setenv("TWITTER_AUTH_TOKEN", f"tok{i}")
+            monkeypatch.setenv("X_AUTH_TOKEN", f"tok{i}")
             await get_client(None)
     assert len(main._clients) == 2
     made[0].http.aclose.assert_awaited_once()
@@ -420,25 +431,25 @@ async def test_tools_reject_bad_count(count, message):
         ),
     ],
 )
-def test_twitter_errors_mapping(exc, message):
-    with pytest.raises(ToolError, match=message), twitter_errors():
+def test_x_errors_mapping(exc, message):
+    with pytest.raises(ToolError, match=message), x_errors():
         raise exc
 
 
-def test_twitter_errors_rate_limit_reset():
+def test_x_errors_rate_limit_reset():
     exc = errors.TooManyRequests("429", headers={"x-rate-limit-reset": "1700000000"})
-    with pytest.raises(ToolError, match="Rate limited.*2023-11-14"), twitter_errors():
+    with pytest.raises(ToolError, match="Rate limited.*2023-11-14"), x_errors():
         raise exc
 
 
-def test_twitter_errors_passes_tool_errors_through():
-    with pytest.raises(ToolError, match="^mine$"), twitter_errors():
+def test_x_errors_passes_tool_errors_through():
+    with pytest.raises(ToolError, match="^mine$"), x_errors():
         raise ToolError("mine")
 
 
 @pytest.mark.parametrize("exc", [ValueError("ours"), TypeError("ours")])
-def test_twitter_errors_reraises_unrelated_exceptions(exc):
-    with pytest.raises(type(exc)), twitter_errors():
+def test_x_errors_reraises_unrelated_exceptions(exc):
+    with pytest.raises(type(exc)), x_errors():
         raise exc
 
 
@@ -480,9 +491,10 @@ def test_check_write_raises_on_graphql_errors():
         check_write(response)
 
 
-def test_check_write_accepts_success_and_non_json():
+def test_check_write_accepts_success_and_rejects_non_json():
     check_write(httpx.Response(200, json={"data": {"favorite_tweet": "Done"}}))
-    check_write(httpx.Response(200, text="not json"))
+    with pytest.raises(ToolError, match="did not confirm.*Check.*before retrying"):
+        check_write(httpx.Response(200, text="not json"))
 
 
 async def test_like_tweet_reports_rejection(twikit_client):
@@ -539,7 +551,7 @@ async def test_post_tweet_reply(twikit_client):
     "action,method", [("like", "favorite_tweet"), ("unlike", "unfavorite_tweet")]
 )
 async def test_like_tweet(twikit_client, action, method):
-    ok = httpx.Response(200, json={"data": {}})
+    ok = httpx.Response(200, json={"data": {"action": "Done"}})
     setattr(twikit_client, method, AsyncMock(return_value=ok))
     data = json.loads(await like_tweet("123", action=action))
     assert data["status"] == "success"
@@ -688,7 +700,8 @@ async def test_call_tool_accepts_int_or_numeric_string(twikit_client, count):
 
 
 async def test_call_tool_error_is_tool_error(twikit_client, monkeypatch):
-    monkeypatch.delenv("TWITTER_CT0")
+    monkeypatch.delenv("X_CT0", raising=False)
+    monkeypatch.delenv("TWITTER_CT0", raising=False)
     async with MCPClient(main.mcp) as client:
         result = await client.call_tool("get_profile", {"username": "x"})
     assert result.is_error
@@ -971,7 +984,7 @@ async def test_get_replies_shape_break_and_non_json_are_tool_errors(twikit_clien
     "action,method", [("retweet", "retweet"), ("undo", "delete_retweet")]
 )
 async def test_retweet(twikit_client, action, method):
-    ok = httpx.Response(200, json={"data": {}})
+    ok = httpx.Response(200, json={"data": {"action": "Done"}})
     setattr(twikit_client, method, AsyncMock(return_value=ok))
     data = json.loads(await main.retweet("123", action=action))
     assert data["status"] == "success"
@@ -1000,10 +1013,16 @@ async def test_retweet_reports_daily_limit(twikit_client):
 )
 async def test_follow_user(twikit_client, action, method):
     twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
-    setattr(twikit_client, method, AsyncMock())
+    operation = "create_friendships" if action == "follow" else "destroy_friendships"
+    body = {"id_str": "123", "following": action == "follow"}
+    setattr(
+        twikit_client.v11,
+        operation,
+        AsyncMock(return_value=(body, httpx.Response(200, json=body))),
+    )
     data = json.loads(await main.follow_user("testuser", action=action))
     assert data["status"] == "success"
-    getattr(twikit_client, method).assert_called_once_with("123")
+    getattr(twikit_client.v11, operation).assert_called_once_with("123")
 
 
 @pytest.mark.parametrize(
@@ -1342,14 +1361,16 @@ async def test_tools_normalize_arguments(twikit_client):
     twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
     await get_profile("@testuser")
     twikit_client.get_user_by_screen_name.assert_awaited_once_with("testuser")
-    twikit_client.favorite_tweet = AsyncMock(return_value=httpx.Response(200, json={}))
+    twikit_client.favorite_tweet = AsyncMock(
+        return_value=httpx.Response(200, json={"data": {"favorite_tweet": "Done"}})
+    )
     await like_tweet("https://x.com/u/status/42")
     twikit_client.favorite_tweet.assert_awaited_once_with("42")
 
 
 @pytest.mark.parametrize("cookie", ["abc def", "abc\\n", "tok;x=1", "é"])
 def test_malformed_cookies_are_rejected_without_echo(monkeypatch, cookie):
-    monkeypatch.setenv("TWITTER_CT0", cookie)
+    monkeypatch.setenv("X_CT0", cookie)
     with pytest.raises(ToolError) as info:
         get_auth_context(None, http_mode=False)
     assert "malformed" in str(info.value)
@@ -1359,13 +1380,13 @@ def test_malformed_cookies_are_rejected_without_echo(monkeypatch, cookie):
 
 
 def test_long_x_bodies_are_cut():
-    with pytest.raises(ToolError) as info, twitter_errors():
+    with pytest.raises(ToolError) as info, x_errors():
         raise errors.ServerError("status: 503, message: " + "<html>" * 5000)
     assert len(str(info.value)) < 500
 
 
 def test_local_protocol_error_is_not_echoed():
-    with pytest.raises(ToolError) as info, twitter_errors():
+    with pytest.raises(ToolError) as info, x_errors():
         raise httpx.LocalProtocolError("Illegal header value b'SECRETCOOKIE'")
     assert "SECRETCOOKIE" not in str(info.value)
 
@@ -1424,7 +1445,7 @@ async def test_evicted_client_closes_after_its_last_call(monkeypatch):
 
     with patch("main.XClient", side_effect=make):
         async with main.x_client(None) as first:
-            monkeypatch.setenv("TWITTER_AUTH_TOKEN", "tok2")
+            monkeypatch.setenv("X_AUTH_TOKEN", "tok2")
             await get_client(None)  # evicts `first` while it is in use
             assert first.evicted
             first.http.aclose.assert_not_awaited()
@@ -1437,12 +1458,12 @@ async def test_cache_is_least_recently_used(monkeypatch):
 
     def make(_lang):
         client = new_twikit_mock()
-        made[os.environ["TWITTER_AUTH_TOKEN"]] = client
+        made[os.environ["X_AUTH_TOKEN"]] = client
         return client
 
     with patch("main.XClient", side_effect=make):
         for token in ["a", "b", "a", "c"]:  # "a" used again, so "b" is oldest
-            monkeypatch.setenv("TWITTER_AUTH_TOKEN", token)
+            monkeypatch.setenv("X_AUTH_TOKEN", token)
             await get_client(None)
     made["b"].http.aclose.assert_awaited_once()
     made["a"].http.aclose.assert_not_awaited()
@@ -1866,3 +1887,143 @@ async def test_get_tweets_public_index_error_is_shape_error(twikit_client):
     )
     with pytest.raises(ToolError, match="Unexpected X response shape"):
         await get_tweets("testuser")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        [
+            {"message": "already liked", "code": 139},
+            {"message": "daily limit", "code": 344},
+        ],
+        [
+            {"message": "daily limit", "code": 344},
+            {"message": "already liked", "code": 139},
+        ],
+    ],
+)
+def test_check_write_does_not_hide_other_errors_after_already_done(body):
+    with pytest.raises(ToolError, match="daily limit"):
+        check_write(httpx.Response(200, json={"errors": body}), frozenset({139}))
+
+
+@pytest.mark.parametrize("body", [None, [], "ok", {}, {"data": None}, {"data": {}}])
+def test_check_write_rejects_unconfirmed_response_shapes(body):
+    with pytest.raises(ToolError, match="did not confirm"):
+        check_write(httpx.Response(200, json=body))
+
+
+async def test_post_tweet_without_id_never_reports_success(twikit_client):
+    twikit_client.create_tweet = AsyncMock(return_value=None)
+    with pytest.raises(ToolError, match="did not confirm.*Check.*before retrying"):
+        await post_tweet("Hello")
+    twikit_client.create_tweet.assert_awaited_once()
+
+
+async def test_collect_dedupes_each_later_page_before_applying_count():
+    page = Page([make_tweet(1)], [[make_tweet(2), make_tweet(2), make_tweet(3)]])
+    assert [tweet.id for tweet in await main.collect(page, 3)] == ["1", "2", "3"]
+
+
+async def test_cold_client_evicted_before_waiter_resumes_is_not_used(monkeypatch):
+    monkeypatch.setattr(main, "HTTP_MODE", True)
+    monkeypatch.setattr(main, "_MAX_CLIENTS", 1)
+    made = []
+
+    def make(_lang):
+        client = new_twikit_mock()
+
+        async def handshake():
+            await asyncio.sleep(0)
+
+        client.handshake.side_effect = handshake
+        made.append(client)
+        return client
+
+    async def use(token):
+        ctx = SimpleNamespace(headers={"authorization": f"Bearer {token}:c"})
+        async with main.x_client(ctx) as client:
+            assert not client.evicted, "an evicted client must be reacquired before use"
+            client.http.aclose.assert_not_awaited()
+            await asyncio.sleep(0)
+
+    with patch("main.XClient", side_effect=make):
+        await asyncio.gather(use("first"), use("second"))
+    assert all(c.inflight == 0 for c in made)
+
+
+async def test_get_replies_dedupes_first_and_later_pages(twikit_client):
+    twikit_client.gql.tweet_detail = AsyncMock(side_effect=[({}, None), ({}, None)])
+    with (
+        patch(
+            "main.replies_from_tweet_detail",
+            side_effect=[
+                [make_tweet(2), make_tweet(2)],
+                [make_tweet(3), make_tweet(3), make_tweet(4)],
+            ],
+        ),
+        patch("main.bottom_cursor", side_effect=["next", None]),
+    ):
+        result = json.loads(await get_replies("1", count=4))
+    assert [tweet["id"] for tweet in result] == ["2", "3", "4"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://x.com/u/status/123abc",
+        "https://x.com/u/status/12345678901234567890123456",
+    ],
+)
+def test_tweet_urls_do_not_silently_truncate_invalid_ids(value):
+    with pytest.raises(ToolError, match="Invalid argument"):
+        main.tweet_id_arg(value)
+
+
+async def test_follow_user_does_not_ignore_rest_error_envelope(twikit_client):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    body = {
+        "id": 123,
+        "following": False,
+        "errors": [{"message": "follow limit", "code": 161}],
+    }
+    twikit_client.v11.create_friendships = AsyncMock(
+        return_value=(body, httpx.Response(200, json=body))
+    )
+    twikit_client.follow_user = AsyncMock(return_value=make_user())
+    with pytest.raises(ToolError, match="rejected the action.*follow limit"):
+        await main.follow_user("testuser")
+
+
+@pytest.mark.parametrize(
+    "action,body",
+    [
+        ("follow", {"id_str": "123", "following": False}),
+        ("unfollow", {"id_str": "123", "following": True}),
+        ("follow", {"id_str": "999", "following": True}),
+        ("follow", {"id_str": "123"}),
+        ("follow", {"id_str": "123", "following": "true"}),
+        ("follow", {"id_str": "123", "following": 1}),
+    ],
+)
+async def test_follow_user_requires_confirmation_of_correct_relationship(
+    twikit_client, action, body
+):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    operation = "create_friendships" if action == "follow" else "destroy_friendships"
+    setattr(
+        twikit_client.v11,
+        operation,
+        AsyncMock(return_value=(body, httpx.Response(200, json=body))),
+    )
+    with pytest.raises(ToolError, match="did not confirm.*Check.*before retrying"):
+        await main.follow_user("testuser", action=action)
+
+
+async def test_follow_user_reports_pending_private_follow_request(twikit_client):
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    body = {"id_str": "123", "following": False, "follow_request_sent": True}
+    twikit_client.v11.create_friendships = AsyncMock(
+        return_value=(body, httpx.Response(200, json=body))
+    )
+    assert json.loads(await main.follow_user("testuser")) == {"status": "requested"}
