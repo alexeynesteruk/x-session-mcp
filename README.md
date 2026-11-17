@@ -86,20 +86,31 @@ Set `APP_PORT` (and optionally `APP_HOST`, default `127.0.0.1`):
 APP_PORT=3000 .venv/bin/python main.py
 ```
 
-Connect to `http://localhost:3000/mcp`. Every request must carry its own cookies:
+Connect to `http://localhost:3000/mcp`. `/x` is the same endpoint (the public
+gateway path `https://mcp.31415926.xyz/x` is rewritten to `/mcp` in the app).
+
+Every request must identify the caller. Either send that request's own cookies:
 
 ```
 Authorization: Bearer <auth_token>:<ct0>
 ```
 
-In HTTP mode (decided by `APP_PORT`, not by the request) the server never falls
-back to the cookies in its own `.env`, so anything that can reach the port
-cannot act as the server owner. On localhost, requests with a foreign `Host` or
-`Origin` are rejected (DNS-rebinding protection).
+or, when `X_DATABASE_URL` points at MySQL database `mcp_x` and `X_HTTP_TOKEN` is
+set, send the app token and the server loads the cookies from `session`:
 
-The cookies travel in plaintext, so put a TLS proxy in front of anything that
-is not localhost. Binding `APP_HOST=0.0.0.0` (needed inside Docker) turns the
-Host/Origin checks off.
+```
+Authorization: Bearer <X_HTTP_TOKEN>
+```
+
+In HTTP mode (decided by `APP_PORT`, not by the request) the server never falls
+back to the cookies in its own `.env`. A request with no `Authorization` header
+cannot act as the account. The env cookies are only a one-time seed when the
+MySQL table is empty. On localhost, requests with a foreign `Host` or `Origin`
+are rejected (DNS-rebinding protection).
+
+The cookies and the app token travel in plaintext, so put a TLS proxy in front
+of anything that is not localhost. Binding `APP_HOST=0.0.0.0` (needed inside
+Docker) turns the Host/Origin checks off.
 
 ### Docker
 

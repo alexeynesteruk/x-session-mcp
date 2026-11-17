@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import html
 import json
 import logging
@@ -32,6 +33,7 @@ from twikit.x_client_transaction.interpolate import interpolate
 from twikit.x_client_transaction.rotation import convert_rotation_to_matrix
 from twikit.x_client_transaction.utils import float_to_hex, is_odd
 
+import session_store
 from config import HOST, PORT
 
 logger = logging.getLogger(__name__)
@@ -109,17 +111,54 @@ def parse_bearer(header: str) -> AuthContext:
     return checked_cookies(auth_token, ct0)
 
 
+def env_cookies() -> tuple[str | None, str | None]:
+    auth_token = os.getenv("X_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN")
+    ct0 = os.getenv("X_CT0") or os.getenv("TWITTER_CT0")
+    return auth_token, ct0
+
+
+def _bearer_token(header: str) -> str | None:
+    parts = header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    return parts[1]
+
+
+def _app_token_matches(header: str) -> bool:
+    """True when Authorization is the app gate, not an X cookie pair."""
+    expected = os.getenv("X_HTTP_TOKEN") or ""
+    presented = _bearer_token(header)
+    if not expected or presented is None:
+        return False
+    return hmac.compare_digest(presented, expected)
+
+
+def stored_auth_context() -> AuthContext:
+    """Cookies from MySQL. Used only after X_HTTP_TOKEN checks out."""
+    if not session_store.database_url():
+        raise ToolError(f"{AUTH_REQUIRED} (X_DATABASE_URL is not set)")
+    try:
+        stored = session_store.load_default()
+    except session_store.SessionStoreError as exc:
+        logger.warning("X session store: %s", exc)
+        raise ToolError(f"{AUTH_REQUIRED} (session store unavailable)") from exc
+    if stored is None:
+        raise ToolError(f"{AUTH_REQUIRED} (no session row in MySQL)")
+    return checked_cookies(stored.auth_token, stored.ct0)
+
+
 def get_auth_context(
     headers: Mapping[str, str] | None, http_mode: bool | None = None
 ) -> AuthContext:
     """Resolve the X session cookies for one tool call.
 
-    In HTTP mode (APP_PORT set) the caller must send its own cookies in the
-    Authorization header and the server never falls back to its own env
-    cookies, so anything that can reach the port cannot act as the server
-    owner. The mode is decided by config, not by whether the transport
-    happened to expose headers. Over stdio the cookies come from
-    X_AUTH_TOKEN/X_CT0 (TWITTER_* aliases still accepted).
+    In HTTP mode (APP_PORT set) the server never reads its own env cookies.
+    Callers either send `Authorization: Bearer <auth_token>:<ct0>` or, when
+    the cookies live in MySQL, `Authorization: Bearer <X_HTTP_TOKEN>`. A
+    request with no Authorization header cannot act as the account. Over
+    stdio the cookies come from X_AUTH_TOKEN/X_CT0 (TWITTER_* aliases still
+    accepted). The mode is decided by config, not by whether the transport
+    happened to expose headers.
     """
     if http_mode is None:
         http_mode = HTTP_MODE
@@ -127,12 +166,64 @@ def get_auth_context(
         header = (headers or {}).get("authorization")
         if not header:
             raise ToolError(AUTH_REQUIRED)
+        if _app_token_matches(header):
+            return stored_auth_context()
         return parse_bearer(header)
-    auth_token = os.getenv("X_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN")
-    ct0 = os.getenv("X_CT0") or os.getenv("TWITTER_CT0")
+    auth_token, ct0 = env_cookies()
     if not auth_token or not ct0:
         raise ToolError(f"{AUTH_REQUIRED} (set X_AUTH_TOKEN and X_CT0)")
     return checked_cookies(auth_token, ct0)
+
+
+class PathAliasMiddleware:
+    """Rewrite `/x` to `/mcp` so the gateway URL and the in-process route match.
+
+    cloudflared forwards the public path unchanged. `https://mcp.31415926.xyz/x`
+    arrives as `/x`. The streamable HTTP app is mounted at `/mcp`.
+    """
+
+    def __init__(self, app: Any, aliases: Mapping[str, str]) -> None:
+        self.app = app
+        self.aliases = dict(aliases)
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path") or ""
+            for src, dst in self.aliases.items():
+                if path == src or path.startswith(src + "/"):
+                    new_path = dst + path[len(src) :]
+                    scope = dict(scope)
+                    scope["path"] = new_path
+                    scope["raw_path"] = new_path.encode("ascii")
+                    break
+        await self.app(scope, receive, send)
+
+
+def build_http_app(host: str) -> Any:
+    app = mcp.streamable_http_app(host=host)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["mcp-session-id"],
+    )
+    # Added last so it runs first and the router sees `/mcp`.
+    app.add_middleware(PathAliasMiddleware, aliases={"/x": "/mcp"})
+    return app
+
+
+def prepare_http_session() -> None:
+    """Open MySQL when configured. Seed only if the table has no row yet."""
+    if not session_store.database_url():
+        logger.info("X_DATABASE_URL unset; HTTP mode will require cookie bearer")
+        return
+    token, ct0 = env_cookies()
+    try:
+        status = session_store.prepare_database(token, ct0)
+    except session_store.SessionStoreError as exc:
+        raise SystemExit(f"X session store: {exc}") from exc
+    logger.info("X session store: %s", status)
 
 
 # First path segments of x.com URLs that are not profiles.
@@ -1112,15 +1203,8 @@ async def get_replies(
 
 def main() -> None:
     if HTTP_MODE:
-        app = mcp.streamable_http_app(host=HOST)
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            expose_headers=["mcp-session-id"],
-        )
-        uvicorn.run(app, host=HOST, port=int(PORT))
+        prepare_http_session()
+        uvicorn.run(build_http_app(HOST), host=HOST, port=int(PORT))
     else:
         mcp.run("stdio")
 

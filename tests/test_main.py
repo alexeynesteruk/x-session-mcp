@@ -64,6 +64,8 @@ def no_network(monkeypatch):
 def stdio_cookies(monkeypatch):
     monkeypatch.setenv("X_AUTH_TOKEN", "env_token")
     monkeypatch.setenv("X_CT0", "env_ct0")
+    monkeypatch.delenv("X_DATABASE_URL", raising=False)
+    monkeypatch.delenv("X_HTTP_TOKEN", raising=False)
     monkeypatch.setattr(main, "HTTP_MODE", False)
     main._clients.clear()
     main._pending.clear()
@@ -189,6 +191,37 @@ def test_http_mode_never_falls_back_to_env(headers):
 def test_http_uses_header_cookies():
     headers = {"authorization": "Bearer tok:csrf"}
     assert get_auth_context(headers, http_mode=True) == AuthContext("tok", "csrf")
+
+
+def test_http_app_token_uses_mysql_session(monkeypatch):
+    monkeypatch.setenv("X_HTTP_TOKEN", "app-token")
+    monkeypatch.setenv("X_DATABASE_URL", "mysql://mcp_x_app:pw@10.0.0.153:3306/mcp_x")
+    monkeypatch.setattr(
+        main.session_store,
+        "load_default",
+        lambda: main.session_store.StoredSession("dbtoken", "dbct0", "test"),
+    )
+    assert get_auth_context(
+        {"authorization": "Bearer app-token"}, http_mode=True
+    ) == AuthContext("dbtoken", "dbct0")
+
+
+def test_http_app_token_does_not_use_env_cookies(monkeypatch):
+    monkeypatch.setenv("X_HTTP_TOKEN", "app-token")
+    monkeypatch.setattr(main.session_store, "database_url", lambda: None)
+    with pytest.raises(ToolError, match="X_DATABASE_URL"):
+        get_auth_context({"authorization": "Bearer app-token"}, http_mode=True)
+
+
+def test_http_wrong_token_does_not_open_stored_session(monkeypatch):
+    monkeypatch.setenv("X_HTTP_TOKEN", "app-token")
+
+    def fail_load():
+        raise AssertionError("stored session must not be loaded")
+
+    monkeypatch.setattr(main.session_store, "load_default", fail_load)
+    with pytest.raises(ToolError, match="AUTH_REQUIRED"):
+        get_auth_context({"authorization": "Bearer other-token"}, http_mode=True)
 
 
 # ============================================================================
@@ -713,7 +746,9 @@ async def test_call_tool_error_is_tool_error(twikit_client, monkeypatch):
 # ============================================================================
 
 
-async def http_call(app, headers: dict, name: str, arguments: dict) -> dict:
+async def http_call(
+    app, headers: dict, name: str, arguments: dict, path: str = "/mcp"
+) -> dict:
     base = {
         "content-type": "application/json",
         "accept": "application/json, text/event-stream",
@@ -732,12 +767,12 @@ async def http_call(app, headers: dict, name: str, arguments: dict) -> dict:
                 "clientInfo": {"name": "t", "version": "0"},
             },
         }
-        r = await c.post("/mcp", headers=base | headers, json=initialize)
+        r = await c.post(path, headers=base | headers, json=initialize)
         h = base | headers | {"mcp-protocol-version": "2025-06-18"}
         if sid := r.headers.get("mcp-session-id"):
             h["mcp-session-id"] = sid
         await c.post(
-            "/mcp",
+            path,
             headers=h,
             json={"jsonrpc": "2.0", "method": "notifications/initialized"},
         )
@@ -747,7 +782,7 @@ async def http_call(app, headers: dict, name: str, arguments: dict) -> dict:
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments},
         }
-        r = await c.post("/mcp", headers=h, json=call)
+        r = await c.post(path, headers=h, json=call)
     if r.headers.get("content-type", "").startswith("text/event-stream"):
         data = [ln[5:] for ln in r.text.splitlines() if ln.startswith("data:")]
         return json.loads(data[-1])["result"]
@@ -759,7 +794,7 @@ async def http_app(monkeypatch):
     # Entered inside the test, not as a fixture: anyio's cancel scope must be
     # exited in the same task that entered it.
     monkeypatch.setattr(main, "HTTP_MODE", True)
-    app = main.mcp.streamable_http_app(host="127.0.0.1")
+    app = main.build_http_app("127.0.0.1")
     async with app.router.lifespan_context(app):
         yield app
 
@@ -781,6 +816,29 @@ async def test_http_bearer_cookies_are_used(monkeypatch, twikit_client):
     assert result["isError"] is False
     twikit_client.set_cookies.assert_called_once_with(
         {"auth_token": "tok", "ct0": "csrf"}
+    )
+
+
+async def test_http_gateway_path_uses_mysql_session(monkeypatch, twikit_client):
+    monkeypatch.setenv("X_HTTP_TOKEN", "app-token")
+    monkeypatch.setenv("X_DATABASE_URL", "mysql://mcp_x_app:pw@10.0.0.153:3306/mcp_x")
+    monkeypatch.setattr(
+        main.session_store,
+        "load_default",
+        lambda: main.session_store.StoredSession("dbtoken", "dbct0", "test"),
+    )
+    twikit_client.get_user_by_screen_name = AsyncMock(return_value=make_user())
+    async with http_app(monkeypatch) as app:
+        result = await http_call(
+            app,
+            {"Authorization": "Bearer app-token"},
+            "get_profile",
+            {"username": "x"},
+            path="/x",
+        )
+    assert result["isError"] is False
+    twikit_client.set_cookies.assert_called_once_with(
+        {"auth_token": "dbtoken", "ct0": "dbct0"}
     )
 
 

@@ -75,6 +75,8 @@ pyjsparser==2.7.1
     # via js2py-3-13
 pyjwt==2.15.1
     # via mcp
+pymysql==1.1.1
+    # via -r requirements.txt
 pyotp==2.10.0
     # via twikit
 python-dotenv==1.2.4
